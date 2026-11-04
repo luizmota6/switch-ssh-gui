@@ -1,5 +1,6 @@
-//! Worker SSH em thread dedicada. A UI conversa com ele por canais mpsc.
+//! Worker de conexão (SSH ou Telnet) em thread dedicada. A UI conversa com ele por canais mpsc.
 
+use crate::config::Protocol;
 use base64::Engine;
 use ssh2::{HashType, KeyboardInteractivePrompt, Prompt, Session};
 use std::collections::VecDeque;
@@ -19,6 +20,7 @@ pub enum Auth {
 }
 
 pub struct ConnectParams {
+    pub protocol: Protocol,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -63,18 +65,22 @@ pub fn spawn(params: ConnectParams, ctx: eframe::egui::Context) -> SshHandle {
     let (tx_cmd, rx_cmd) = mpsc::channel();
     let (tx_ev, rx_ev) = mpsc::channel();
     thread::Builder::new()
-        .name("ssh-worker".into())
+        .name("conn-worker".into())
         .spawn(move || {
             let emit = |ev: FromWorker| {
                 let _ = tx_ev.send(ev);
                 ctx.request_repaint();
             };
-            if let Err(e) = run(params, &rx_cmd, &emit) {
+            let res = match params.protocol {
+                Protocol::Ssh => run(params, &rx_cmd, &emit),
+                Protocol::Telnet => crate::telnet::run(params, &rx_cmd, &emit),
+            };
+            if let Err(e) = res {
                 emit(FromWorker::Error(e));
             }
             emit(FromWorker::Closed);
         })
-        .expect("falha ao criar thread SSH");
+        .expect("falha ao criar thread de conexão");
     SshHandle {
         tx: tx_cmd,
         rx: rx_ev,
@@ -89,34 +95,56 @@ impl KeyboardInteractivePrompt for PasswordPrompter {
     }
 }
 
-const PAGER_MARKERS: [&str; 5] = [
-    "--more--",
-    "-- more --",
-    "---- more ----",
-    "press any key to continue",
-    "<--- more --->",
+/// (marcador em minúsculas, tecla a enviar)
+const PAGER_MARKERS: [(&str, &[u8]); 6] = [
+    ("--more--", b" "),
+    ("-- more --", b" "),
+    ("---- more ----", b" "),
+    ("press any key to continue", b" "),
+    ("<--- more --->", b" "),
+    // MikroTik RouterOS: "-- [Q quit|D dump|down]" -> D despeja o resto sem paginar
+    ("[q quit|d dump|down]", b"d"),
 ];
 
-fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> Result<(), String> {
-    // 1. TCP
-    emit(FromWorker::Status(format!("Conectando a {}:{}…", p.host, p.port)));
-    let addrs: Vec<_> = (p.host.as_str(), p.port)
+/// Acumula o texto recebido em `tail` e, se apareceu um marcador de paginação,
+/// devolve a tecla que o responde.
+pub(crate) fn pager_hit(tail: &mut String, text: &str) -> Option<&'static [u8]> {
+    tail.push_str(&text.to_lowercase());
+    if tail.len() > 256 {
+        let cut = tail.len() - 128;
+        let cut = (cut..tail.len()).find(|&i| tail.is_char_boundary(i)).unwrap_or(0);
+        tail.drain(..cut);
+    }
+    let reply = PAGER_MARKERS.iter().find(|(m, _)| tail.contains(m)).map(|(_, k)| *k);
+    if reply.is_some() {
+        tail.clear();
+    }
+    reply
+}
+
+/// Resolve o host e abre a conexão TCP (tenta todos os endereços).
+pub(crate) fn connect_tcp(host: &str, port: u16, emit: &dyn Fn(FromWorker)) -> Result<TcpStream, String> {
+    emit(FromWorker::Status(format!("Conectando a {host}:{port}…")));
+    let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| format!("Não foi possível resolver '{}': {e}", p.host))?
+        .map_err(|e| format!("Não foi possível resolver '{host}': {e}"))?
         .collect();
     let mut last_err = String::from("nenhum endereço");
-    let mut tcp = None;
     for a in &addrs {
         match TcpStream::connect_timeout(a, Duration::from_secs(8)) {
             Ok(s) => {
-                tcp = Some(s);
-                break;
+                let _ = s.set_nodelay(true);
+                return Ok(s);
             }
             Err(e) => last_err = format!("{a}: {e}"),
         }
     }
-    let tcp = tcp.ok_or_else(|| format!("Falha TCP ({last_err})"))?;
-    let _ = tcp.set_nodelay(true);
+    Err(format!("Falha TCP ({last_err})"))
+}
+
+fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> Result<(), String> {
+    // 1. TCP
+    let tcp = connect_tcp(&p.host, p.port, emit)?;
 
     // 2. Handshake SSH
     let mut sess = Session::new().map_err(|e| e.to_string())?;
@@ -179,7 +207,11 @@ fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> 
     }
 
     // 4. Autenticação
-    emit(FromWorker::Status(format!("Autenticando como {}…", p.user)));
+    emit(FromWorker::Status(if p.user.is_empty() {
+        "Autenticando (sem usuário)…".to_string()
+    } else {
+        format!("Autenticando como {}…", p.user)
+    }));
     let methods = sess.auth_methods(&p.user).unwrap_or("").to_string();
     if !sess.authenticated() {
         match &p.auth {
@@ -242,17 +274,8 @@ fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> 
                     if text.is_empty() {
                         continue;
                     }
-                    if auto_pager {
-                        tail.push_str(&text.to_lowercase());
-                        if tail.len() > 256 {
-                            let cut = tail.len() - 128;
-                            let cut = (cut..tail.len()).find(|&i| tail.is_char_boundary(i)).unwrap_or(0);
-                            tail.drain(..cut);
-                        }
-                        if PAGER_MARKERS.iter().any(|m| tail.contains(m)) {
-                            tail.clear();
-                            write_nb(&mut ch, b" ")?;
-                        }
+                    if let Some(key) = auto_pager.then(|| pager_hit(&mut tail, &text)).flatten() {
+                        write_nb(&mut ch, key)?;
                     }
                     emit(FromWorker::Data(text));
                 }
@@ -345,7 +368,7 @@ fn write_nb(ch: &mut ssh2::Channel, mut data: &[u8]) -> Result<(), String> {
 }
 
 /// Decodifica UTF-8 preservando sequências multibyte cortadas entre leituras.
-fn decode_utf8(carry: &mut Vec<u8>, new: &[u8]) -> String {
+pub(crate) fn decode_utf8(carry: &mut Vec<u8>, new: &[u8]) -> String {
     carry.extend_from_slice(new);
     match std::str::from_utf8(carry) {
         Ok(s) => {
@@ -372,6 +395,14 @@ mod tests {
     use super::*;
     use crate::term::Terminal;
 
+    #[test]
+    fn pager_responde_por_fabricante() {
+        let mut t = String::new();
+        assert_eq!(pager_hit(&mut t, "linha\r\n --More-- "), Some(&b" "[..]));
+        assert_eq!(pager_hit(&mut t, "x\r\n-- [Q quit|D dump|down]"), Some(&b"d"[..]));
+        assert_eq!(pager_hit(&mut t, "show lines 1-40"), None);
+    }
+
     /// Integração contra sshd local (SSH_TEST_HOST=127.0.0.1:2222). Ignorado por padrão.
     #[test]
     #[ignore]
@@ -379,6 +410,7 @@ mod tests {
         let ctx = eframe::egui::Context::default();
         let h = spawn(
             ConnectParams {
+                protocol: Protocol::Ssh,
                 host: "127.0.0.1".into(),
                 port: 2222,
                 user: "sw".into(),

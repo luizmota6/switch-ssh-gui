@@ -1,9 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod backup;
 mod config;
 mod ssh;
+mod telnet;
 mod term;
+mod totp;
+mod vault;
 mod vendor;
 mod vterm;
 

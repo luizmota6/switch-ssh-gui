@@ -14,6 +14,14 @@ directories = "6"
 chrono = "0.4"
 base64 = "0.22"
 vt100 = "0.18.1"
+# Cofre (senha mestra + 2FA TOTP)
+argon2 = "0.5"
+aes-gcm = "0.10"
+getrandom = "0.2"
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2"
+qrcode = { version = "0.14", default-features = false }
 
 # Windows: OpenSSL estático em vez de WinCNG -> suporta curve25519, ed25519,
 # AES-GCM e chacha20 (exigidos por OpenSSH moderno). Compilar requer Perl

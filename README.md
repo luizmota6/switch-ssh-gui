@@ -4,7 +4,9 @@ Interface desktop para acesso SSH/CLI a switches gerenciáveis. Binário único,
 
 ## Recursos
 
-- **Perfis de switch** (nome, host, porta, usuário, fabricante, comandos personalizados) — salvos em JSON. **Senha nunca é gravada em disco.**
+- **Perfis de switch** (nome, protocolo, host, porta, usuário, fabricante, comandos personalizados) — salvos em JSON. **Senha nunca é gravada em disco.** O usuário é opcional.
+- **SSH ou Telnet** por perfil. No Telnet (porta 23, **sem criptografia**) o app negocia eco/tamanho da janela/tipo de terminal e, se usuário e senha estiverem preenchidos, responde sozinho aos prompts `Username:`/`login:` e `Password:`; com eles em branco, digite no terminal. Os comandos de inicialização do fabricante só são enviados depois que aparece o prompt da CLI (`#`, `>` ou `]`).
+- **Senha mestra + 2FA (opcional)** — em **🔒 Segurança**: a abertura do programa passa a pedir senha mestra e o código TOTP de 6 dígitos (Google/Microsoft Authenticator, Authy…; cadastro por QR code). Perfis, chaves de host e — se marcado "Lembrar senha no cofre" — as senhas dos switches ficam em `cofre.json`, cifrado com AES-256-GCM e chave derivada por Argon2id. 10 códigos de recuperação de uso único para o caso de perder o celular; botão **Bloquear** fecha o cofre na hora. **A senha mestra não pode ser recuperada.**
 - **Autenticação** por senha (com fallback *keyboard-interactive*, comum em switches) ou chave privada (+ passphrase).
 - **Verificação de chave do host (TOFU)**: na 1ª conexão mostra o fingerprint `SHA256:` para conferir; nas próximas, bloqueia a conexão se a chave mudar (alerta de MITM).
 - **Emulador de terminal xterm-256color completo** (crate `vt100`): cores, tela alternativa, cursor — roda **nano, vim, htop, mc** e menus de switch. O PTY acompanha o tamanho da janela.
@@ -19,8 +21,14 @@ Interface desktop para acesso SSH/CLI a switches gerenciáveis. Binário único,
 | Aruba AOS-S / ProCurve | `no page`, `terminal width 200` | idem (sintaxe AOS-S) |
 | Cisco IOS/IOS-XE | `terminal length 0`, `terminal width 0` | version, ip int brief, int status, vlan, mac, CDP/LLDP, running-config, logging |
 | HPE Comware | `screen-length disable` | display version/interface/vlan/mac/lldp/current-configuration/logbuffer |
+| Dell (N-Series OS6 / OS9 / OS10) | `terminal length 0` | version, ip int brief, int status, vlan, mac, LLDP, running-config, logging |
+| MikroTik RouterOS | — (o pager `[Q quit\|D dump\|down]` é respondido com D) | resource, routerboard, interfaces, IP, rotas, bridge host, neighbors, `/export`, log |
+| Palo Alto PAN-OS | `set cli pager off` | system info/resources, interfaces, rotas, ARP, sessões, HA, jobs, `show config running` |
+
+Backup da configuração por fabricante: `show running-config` (`.cfg`) na maioria; Comware `display current-configuration` (`.cfg`); MikroTik `/export` (`.rsc`, reimporta com `/import`); Palo Alto `show config running` (`.xml`, formato que o PAN-OS importa).
 | Genérico | — | só os personalizados |
 
+- **Backup da configuração** (SSH ou Telnet): botão no painel direito executa `show running-config` (Comware: `display current-configuration`), pagina sozinho, espera o prompt voltar e grava só a configuração (sem eco nem prompt) em `backups\<perfil>_<data>.cfg`. Respostas de erro da CLI (ex.: falta de `enable` no Cisco) não viram arquivo.
 - **Confirmação de comandos perigosos** (`reload`, `boot`, `erase`, `delete`, `format`, `shutdown`, `no vlan`, `factory`…).
 - **Log automático da sessão** em arquivo + "Salvar saída" e "Copiar tudo".
 - Keepalive SSH a cada 30 s; buffer de 50.000 linhas com renderização virtualizada.
@@ -30,7 +38,9 @@ Interface desktop para acesso SSH/CLI a switches gerenciáveis. Binário único,
 | | Windows | Linux |
 |---|---|---|
 | Config/perfis/known hosts | `%APPDATA%\switch-ssh-gui\config\config.json` | `~/.config/switch-ssh-gui/config.json` |
+| Idem, com senha mestra + 2FA (cifrado) | `%APPDATA%\switch-ssh-gui\config\cofre.json` | `~/.config/switch-ssh-gui/cofre.json` |
 | Logs | `%APPDATA%\switch-ssh-gui\data\logs\` | `~/.local/share/switch-ssh-gui/logs/` |
+| Backups de configuração | `%APPDATA%\switch-ssh-gui\data\backups\` | `~/.local/share/switch-ssh-gui/backups/` |
 
 ## Compilar
 

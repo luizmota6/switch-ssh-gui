@@ -1,4 +1,8 @@
-use crate::config::{logs_dir, AuthKind, Config, Profile};
+mod security;
+
+use crate::backup::{self, Backup};
+use security::{LockScreen, SecurityDialog, VaultSession};
+use crate::config::{backups_dir, logs_dir, AuthKind, Config, Profile, Protocol};
 use crate::ssh::{self, Auth, ConnectParams, FromWorker, SshHandle, ToWorker};
 use crate::term::Terminal;
 use crate::vendor::{is_dangerous, Vendor};
@@ -40,19 +44,28 @@ pub struct SwitchApp {
 
     log: Option<(BufWriter<File>, PathBuf)>,
     last_log_path: Option<PathBuf>,
+
+    backup: Option<Backup>,
+    last_backup_path: Option<PathBuf>,
+
+    /// Cofre aberto (senha mestra + 2FA ativos). `None` = modo sem cofre (config.json).
+    vault: Option<VaultSession>,
+    /// Tela de desbloqueio (o app fica inacessível enquanto `Some`).
+    locked: Option<LockScreen>,
+    security: Option<SecurityDialog>,
+    /// Checkbox "lembrar senha no cofre" do perfil em edição.
+    remember_pw: bool,
 }
 
 impl SwitchApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let cfg = Config::load();
-        let (selected, form) = match cfg.profiles.first() {
-            Some(p) => (Some(0), p.clone()),
-            None => (None, Profile::default()),
-        };
-        Self {
+        let locked = crate::vault::exists().then(LockScreen::default);
+        // com cofre, a configuração só é carregada depois do desbloqueio
+        let cfg = if locked.is_some() { Config::default() } else { Config::load() };
+        let mut app = Self {
             cfg,
-            selected,
-            form,
+            selected: None,
+            form: Profile::default(),
             password: String::new(),
             passphrase: String::new(),
             conn: None,
@@ -70,7 +83,39 @@ impl SwitchApp {
             confirm: None,
             log: None,
             last_log_path: None,
+            backup: None,
+            last_backup_path: None,
+            vault: None,
+            locked,
+            security: None,
+            remember_pw: false,
+        };
+        app.after_config_loaded();
+        app
+    }
+
+    /// Chamado ao carregar a configuração (início ou desbloqueio do cofre).
+    fn after_config_loaded(&mut self) {
+        self.cfg.ensure_ids();
+        match self.cfg.profiles.first().cloned() {
+            Some(p) => {
+                self.selected = Some(0);
+                self.select_form(p);
+            }
+            None => {
+                self.selected = None;
+                self.select_form(Profile::default());
+            }
         }
+    }
+
+    /// Carrega um perfil no formulário (e a senha salva no cofre, se houver).
+    fn select_form(&mut self, p: Profile) {
+        let saved = self.vault.as_ref().and_then(|v| v.passwords.get(&p.id).cloned());
+        self.remember_pw = saved.is_some();
+        self.password = saved.unwrap_or_default();
+        self.passphrase.clear();
+        self.form = p;
     }
 
     /// Mensagem local exibida no terminal e no buffer de log.
@@ -80,7 +125,11 @@ impl SwitchApp {
     }
 
     fn save_cfg(&mut self) {
-        if let Err(e) = self.cfg.save() {
+        let res = match &self.vault {
+            Some(v) => v.save(&self.cfg),
+            None => self.cfg.save(),
+        };
+        if let Err(e) = res {
             self.error = Some(format!("Erro ao salvar configuração: {e}"));
         }
     }
@@ -89,11 +138,15 @@ impl SwitchApp {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let p = self.form.clone();
-        if p.host.trim().is_empty() || p.user.trim().is_empty() {
-            self.error = Some("Informe host e usuário.".into());
+        // Usuário pode ficar em branco: alguns switches aceitam login sem usuário.
+        if p.host.trim().is_empty() {
+            self.error = Some("Informe o host.".into());
             return;
         }
+        let telnet = p.protocol == Protocol::Telnet;
         let auth = match p.auth {
+            // Telnet só tem usuário/senha (digitados no prompt do switch).
+            _ if telnet => Auth::Password(self.password.clone()),
             AuthKind::Password => Auth::Password(self.password.clone()),
             AuthKind::Key => {
                 if p.key_path.trim().is_empty() {
@@ -108,6 +161,7 @@ impl SwitchApp {
         };
         let (cols, rows) = self.vterm.size();
         let params = ConnectParams {
+            protocol: p.protocol,
             host: p.host.trim().to_string(),
             port: p.port,
             user: p.user.trim().to_string(),
@@ -120,8 +174,9 @@ impl SwitchApp {
         };
         self.error = None;
         self.echo(&format!(
-            "\r\n\x1b[36m===== {} ({}:{}) — {} =====\x1b[0m\r\n",
+            "\r\n\x1b[36m===== {} ({} {}:{}) — {} =====\x1b[0m\r\n",
             p.display_name(),
+            p.protocol.label(),
             p.host,
             p.port,
             chrono::Local::now().format("%d/%m/%Y %H:%M:%S")
@@ -189,12 +244,15 @@ impl SwitchApp {
                 FromWorker::Connected => {
                     self.state = ConnState::Connected;
                     self.status = match &self.session_profile {
-                        Some(p) => format!("Conectado: {}@{}:{}", p.user, p.host, p.port),
+                        Some(p) => format!("Conectado ({}): {}:{}", p.protocol.label(), p.target(), p.port),
                         None => "Conectado".into(),
                     };
                     self.focus_term = true;
                 }
                 FromWorker::Data(s) => {
+                    if let Some(b) = &mut self.backup {
+                        b.feed(&s);
+                    }
                     self.vterm.process(&s);
                     let done = self.term.feed(&s);
                     if let Some((w, _)) = &mut self.log {
@@ -208,6 +266,9 @@ impl SwitchApp {
                     self.error = Some(e);
                 }
                 FromWorker::Closed => {
+                    if self.backup.take().is_some() {
+                        self.error = Some("Conexão encerrada durante o backup; nada foi salvo.".into());
+                    }
                     self.echo("\r\n\x1b[36m===== conexão encerrada =====\x1b[0m\r\n");
                     self.state = ConnState::Disconnected;
                     self.status = "Desconectado".into();
@@ -216,6 +277,94 @@ impl SwitchApp {
                     return;
                 }
             }
+        }
+    }
+
+    // ---------- backup da configuração ----------
+
+    fn start_backup(&mut self) {
+        let Some(p) = self.session_profile.clone() else { return };
+        if self.state != ConnState::Connected || self.backup.is_some() {
+            return;
+        }
+        let prompt = self.term.lines.last().cloned().unwrap_or_default();
+        if !backup::looks_like_prompt(&prompt) {
+            self.error = Some(
+                "Para o backup, deixe o switch no prompt da CLI (ex.: SW# ou <HPE>) e tente de novo.".into(),
+            );
+            return;
+        }
+        let cmd = p.vendor.backup_command();
+        // a paginação automática precisa estar ligada para a saída vir inteira
+        let pager_off = !p.auto_pager;
+        if let Some(c) = &self.conn {
+            if pager_off {
+                c.send(ToWorker::SetAutoPager(true));
+            }
+            c.send(ToWorker::Send(format!("{cmd}\r").into_bytes()));
+        }
+        self.error = None;
+        self.backup = Some(Backup::new(&prompt, cmd, pager_off));
+        self.status = format!("Backup em andamento ({cmd})…");
+    }
+
+    /// Finaliza/cancela o backup em andamento. `cancel` = descarta sem salvar.
+    fn finish_backup(&mut self, cancel: Option<String>) {
+        let Some(b) = self.backup.take() else { return };
+        if b.restore_pager_off {
+            if let Some(c) = &self.conn {
+                c.send(ToWorker::SetAutoPager(false));
+            }
+        }
+        if let Some(msg) = cancel {
+            self.error = Some(msg);
+            self.status = "Backup cancelado".into();
+            return;
+        }
+        let cfg = match b.result() {
+            Ok(c) => c,
+            Err(e) => {
+                self.error = Some(e);
+                self.status = "Backup falhou".into();
+                return;
+            }
+        };
+        let (name, ext) = self
+            .session_profile
+            .as_ref()
+            .map(|p| (p.display_name(), p.vendor.backup_extension()))
+            .unwrap_or_else(|| ("switch".into(), "cfg"));
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect();
+        let dir = backups_dir();
+        let path = dir.join(format!("{}_{}.{ext}", safe, chrono::Local::now().format("%Y%m%d_%H%M%S")));
+        let res = fs::create_dir_all(&dir).and_then(|_| fs::write(&path, &cfg));
+        match res {
+            Ok(()) => {
+                self.status = format!(
+                    "Backup salvo ({} linhas): {}",
+                    cfg.lines().count(),
+                    path.display()
+                );
+                self.last_backup_path = Some(path);
+            }
+            Err(e) => self.error = Some(format!("Erro ao gravar backup em {}: {e}", path.display())),
+        }
+    }
+
+    fn check_backup(&mut self, ctx: &egui::Context) {
+        let Some(b) = &self.backup else { return };
+        if b.done() {
+            self.finish_backup(None);
+        } else if b.last_data.elapsed() > backup::IDLE_TIMEOUT {
+            self.finish_backup(Some(format!(
+                "Backup sem resposta do switch há {} s; cancelado (nada foi salvo).",
+                backup::IDLE_TIMEOUT.as_secs()
+            )));
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
 
@@ -266,7 +415,19 @@ impl SwitchApp {
 
     fn ui_profiles(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let busy = self.state != ConnState::Disconnected;
-        ui.heading("Switches");
+        ui.horizontal(|ui| {
+            ui.heading("Switches");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("🔒 Segurança").clicked() {
+                    self.security = Some(SecurityDialog::menu());
+                }
+                if self.vault.is_some()
+                    && ui.button("Bloquear").on_hover_text("Fecha o cofre e volta para a tela de senha + código").clicked()
+                {
+                    self.lock();
+                }
+            });
+        });
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
@@ -275,7 +436,7 @@ impl SwitchApp {
             .show(ui, |ui| {
                 let mut pick = None;
                 for (i, p) in self.cfg.profiles.iter().enumerate() {
-                    let txt = format!("{}  ·  {}", p.display_name(), p.host);
+                    let txt = format!("{}  ·  {}  ·  {}", p.display_name(), p.host, p.protocol.label());
                     if ui
                         .add_enabled(!busy, egui::SelectableLabel::new(self.selected == Some(i), txt))
                         .clicked()
@@ -285,9 +446,7 @@ impl SwitchApp {
                 }
                 if let Some(i) = pick {
                     self.selected = Some(i);
-                    self.form = self.cfg.profiles[i].clone();
-                    self.password.clear();
-                    self.passphrase.clear();
+                    self.select_form(self.cfg.profiles[i].clone());
                 }
                 if self.cfg.profiles.is_empty() {
                     ui.weak("Nenhum perfil salvo.");
@@ -298,11 +457,20 @@ impl SwitchApp {
             ui.horizontal(|ui| {
                 if ui.button("➕ Novo").clicked() {
                     self.selected = None;
-                    self.form = Profile::default();
-                    self.password.clear();
+                    self.select_form(Profile::default());
                 }
                 if ui.button("💾 Salvar").clicked() {
+                    if self.form.id.is_empty() {
+                        self.form.id = crate::config::new_id();
+                    }
                     let p = self.form.clone();
+                    if let Some(v) = &mut self.vault {
+                        if self.remember_pw && !self.password.is_empty() {
+                            v.passwords.insert(p.id.clone(), self.password.clone());
+                        } else {
+                            v.passwords.remove(&p.id);
+                        }
+                    }
                     match self.selected {
                         Some(i) => self.cfg.profiles[i] = p,
                         None => {
@@ -318,8 +486,11 @@ impl SwitchApp {
                     .clicked()
                 {
                     if let Some(i) = self.selected.take() {
-                        self.cfg.profiles.remove(i);
-                        self.form = Profile::default();
+                        let removed = self.cfg.profiles.remove(i);
+                        if let Some(v) = &mut self.vault {
+                            v.passwords.remove(&removed.id);
+                        }
+                        self.select_form(Profile::default());
                         self.save_cfg();
                     }
                 }
@@ -333,28 +504,53 @@ impl SwitchApp {
                 ui.label("Nome");
                 ui.text_edit_singleline(&mut self.form.name);
                 ui.end_row();
+                ui.label("Protocolo");
+                ui.horizontal(|ui| {
+                    let before = self.form.protocol;
+                    ui.radio_value(&mut self.form.protocol, Protocol::Ssh, "SSH");
+                    ui.radio_value(&mut self.form.protocol, Protocol::Telnet, "Telnet");
+                    // troca a porta junto, se ainda estava na padrão do protocolo anterior
+                    if self.form.protocol != before && self.form.port == before.default_port() {
+                        self.form.port = self.form.protocol.default_port();
+                    }
+                });
+                ui.end_row();
                 ui.label("Host/IP");
                 ui.text_edit_singleline(&mut self.form.host);
                 ui.end_row();
                 ui.label("Porta");
                 ui.add(egui::DragValue::new(&mut self.form.port).range(1..=65535));
                 ui.end_row();
+                let telnet = self.form.protocol == Protocol::Telnet;
                 ui.label("Usuário");
-                ui.text_edit_singleline(&mut self.form.user);
+                ui.add(egui::TextEdit::singleline(&mut self.form.user).hint_text("(opcional)"))
+                    .on_hover_text(if telnet {
+                        "Preenchido: enviado sozinho no prompt de login. Em branco: digite no terminal."
+                    } else {
+                        "Pode ficar em branco se o switch aceitar login sem usuário."
+                    });
                 ui.end_row();
-                ui.label("Autenticação");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.form.auth, AuthKind::Password, "Senha");
-                    ui.radio_value(&mut self.form.auth, AuthKind::Key, "Chave");
-                });
-                ui.end_row();
-                match self.form.auth {
+                if !telnet {
+                    ui.label("Autenticação");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.form.auth, AuthKind::Password, "Senha");
+                        ui.radio_value(&mut self.form.auth, AuthKind::Key, "Chave");
+                    });
+                    ui.end_row();
+                }
+                match if telnet { AuthKind::Password } else { self.form.auth } {
                     AuthKind::Password => {
                         ui.label("Senha");
                         let r = ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
                         if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             self.connect(ctx);
                         }
+                        ui.end_row();
+                        ui.label("");
+                        let has_vault = self.vault.is_some();
+                        ui.add_enabled(has_vault, egui::Checkbox::new(&mut self.remember_pw, "Lembrar senha no cofre"))
+                            .on_hover_text("Guardada cifrada no cofre ao clicar em 💾 Salvar.")
+                            .on_disabled_hover_text("Ative a senha mestra em 🔒 Segurança para poder salvar senhas.");
                         ui.end_row();
                     }
                     AuthKind::Key => {
@@ -377,6 +573,12 @@ impl SwitchApp {
                     });
                 ui.end_row();
             });
+            if self.form.protocol == Protocol::Telnet {
+                ui.colored_label(
+                    Color32::from_rgb(230, 180, 60),
+                    "⚠ Telnet não é criptografado: senha e comandos trafegam em texto puro.",
+                );
+            }
             ui.checkbox(&mut self.form.auto_pager, "Paginação automática (--More--)");
             ui.label("Comandos personalizados (1 por linha):");
             ui.add(
@@ -388,7 +590,10 @@ impl SwitchApp {
             );
         });
 
-        if let Some(fp) = self.cfg.known_hosts.get(&self.form.host_key_id()).cloned() {
+        let fp = (self.form.protocol == Protocol::Ssh)
+            .then(|| self.cfg.known_hosts.get(&self.form.host_key_id()).cloned())
+            .flatten();
+        if let Some(fp) = fp {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.small(format!("🔑 {fp}"));
@@ -432,6 +637,46 @@ impl SwitchApp {
         ui.heading("Comandos rápidos");
         ui.weak(prof.vendor.label());
         ui.add_space(4.0);
+
+        // backup da configuração (SSH ou Telnet)
+        let mut do_backup = false;
+        let mut cancel_backup = false;
+        if let Some(b) = &self.backup {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Backup… {} linhas", b.lines_captured()));
+            });
+            cancel_backup = ui.small_button("Cancelar backup").clicked();
+        } else {
+            do_backup = ui
+                .add_enabled(
+                    connected,
+                    egui::Button::new(RichText::new("📥 Backup da configuração").strong())
+                        .min_size(egui::vec2(ui.available_width(), 28.0)),
+                )
+                .on_hover_text(format!(
+                    "Executa '{}' e salva em {}",
+                    prof.vendor.backup_command(),
+                    backups_dir().display()
+                ))
+                .clicked();
+        }
+        if ui.small_button("📂 Abrir pasta de backups").clicked() {
+            let dir = backups_dir();
+            let _ = fs::create_dir_all(&dir);
+            open_in_file_manager(&dir);
+        }
+        if let Some(name) = self.last_backup_path.as_ref().and_then(|p| p.file_name()) {
+            ui.small(format!("Último: {}", name.to_string_lossy()));
+        }
+        if do_backup {
+            self.start_backup();
+        }
+        if cancel_backup {
+            self.finish_backup(Some("Backup cancelado pelo usuário (nada foi salvo).".into()));
+        }
+        ui.separator();
+
         let mut to_send = None;
         egui::ScrollArea::vertical().id_salt("quick").show(ui, |ui| {
             ui.add_enabled_ui(connected, |ui| {
@@ -633,9 +878,24 @@ impl SwitchApp {
     }
 }
 
+fn open_in_file_manager(dir: &std::path::Path) {
+    #[cfg(windows)]
+    let prog = "explorer";
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let prog = "xdg-open";
+    let _ = std::process::Command::new(prog).arg(dir).spawn();
+}
+
 impl eframe::App for SwitchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if self.locked.is_some() {
+            self.ui_lock_screen(ctx);
+            return;
+        }
+        self.check_backup(ctx);
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -686,5 +946,6 @@ impl eframe::App for SwitchApp {
         });
 
         self.ui_modals(ctx);
+        self.ui_security(ctx);
     }
 }

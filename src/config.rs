@@ -12,11 +12,37 @@ pub enum AuthKind {
     Key,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Protocol {
+    #[default]
+    Ssh,
+    Telnet,
+}
+
+impl Protocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::Ssh => "SSH",
+            Protocol::Telnet => "Telnet",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Protocol::Ssh => 22,
+            Protocol::Telnet => 23,
+        }
+    }
+}
+
 /// Perfil de switch. A senha NUNCA é persistida.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
+    /// Identificador estável (chave da senha salva no cofre).
+    pub id: String,
     pub name: String,
+    pub protocol: Protocol,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -31,7 +57,9 @@ pub struct Profile {
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            id: String::new(),
             name: String::new(),
+            protocol: Protocol::Ssh,
             host: String::new(),
             port: 22,
             user: "admin".into(),
@@ -47,9 +75,19 @@ impl Default for Profile {
 impl Profile {
     pub fn display_name(&self) -> String {
         if self.name.trim().is_empty() {
-            format!("{}@{}", self.user, self.host)
+            self.target()
         } else {
             self.name.clone()
+        }
+    }
+
+    /// "usuário@host", ou só "host" quando o usuário está em branco.
+    pub fn target(&self) -> String {
+        let user = self.user.trim();
+        if user.is_empty() {
+            self.host.trim().to_string()
+        } else {
+            format!("{user}@{}", self.host.trim())
         }
     }
 
@@ -96,6 +134,24 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("switch-ssh-gui.json"))
 }
 
+/// Arquivo do cofre criptografado (substitui o config.json quando a senha mestra está ativa).
+pub fn vault_path() -> PathBuf {
+    config_path().with_file_name("cofre.json")
+}
+
+/// Identificador aleatório (hex) para perfis.
+pub fn new_id() -> String {
+    let mut b = [0u8; 8];
+    let _ = getrandom::getrandom(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+pub fn backups_dir() -> PathBuf {
+    dirs()
+        .map(|d| d.data_dir().join("backups"))
+        .unwrap_or_else(|| PathBuf::from("backups"))
+}
+
 pub fn logs_dir() -> PathBuf {
     dirs()
         .map(|d| d.data_dir().join("logs"))
@@ -103,6 +159,15 @@ pub fn logs_dir() -> PathBuf {
 }
 
 impl Config {
+    /// Garante que todo perfil tem id (perfis antigos não tinham).
+    pub fn ensure_ids(&mut self) {
+        for p in &mut self.profiles {
+            if p.id.is_empty() {
+                p.id = new_id();
+            }
+        }
+    }
+
     pub fn load() -> Self {
         fs::read_to_string(config_path())
             .ok()
@@ -111,14 +176,17 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        // grava atômico: tmp + rename
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        fs::rename(&tmp, &path).map_err(|e| e.to_string())
+        write_atomic(&config_path(), json.as_bytes())
     }
+}
+
+/// Grava atômico: tmp + rename (nunca deixa o arquivo pela metade).
+pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, data).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
