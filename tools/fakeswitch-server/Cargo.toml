@@ -1,0 +1,15 @@
+[package]
+name = "fakeswitch-server"
+version = "0.1.0"
+edition = "2021"
+description = "Servidor SSH de teste (simula CLI Aruba AOS-CX) para o teste de integração"
+publish = false
+
+# Projeto independente: não faz parte do pacote switch-ssh-gui.
+[workspace]
+
+[dependencies]
+# "ring" em vez do aws-lc-rs padrão: compila no Windows sem CMake/NASM.
+russh = { version = "0.65", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+rand = "0.10"

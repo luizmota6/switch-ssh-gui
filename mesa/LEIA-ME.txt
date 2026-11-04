@@ -1,0 +1,8 @@
+Mesa3D 26.2.6 (llvmpipe, OpenGL por software) - pacote MinGW x64
+Origem: https://github.com/pal1000/mesa-dist-win/releases/tag/26.2.6
+Licença: MIT (Mesa3D) - https://docs.mesa3d.org/license.html
+
+O build.rs copia estas DLLs para target\debug e target\release no Windows.
+Elas permitem abrir o app em máquinas sem GPU / via RDP / VMs.
+Em máquinas com placa de vídeo, apague opengl32.dll e libgallium_wgl.dll
+ao lado do .exe para usar a GPU (opcional; o app é leve em software).

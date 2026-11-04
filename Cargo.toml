@@ -1,0 +1,28 @@
+[package]
+name = "switch-ssh-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Interface desktop (egui) para acesso SSH/CLI a switches gerenciáveis"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", features = ["wgpu"] }
+ssh2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+chrono = "0.4"
+base64 = "0.22"
+vt100 = "0.18.1"
+
+# Windows: OpenSSL estático em vez de WinCNG -> suporta curve25519, ed25519,
+# AES-GCM e chacha20 (exigidos por OpenSSH moderno). Compilar requer Perl
+# (Strawberry Perl); NASM é opcional (acelera o OpenSSL).
+[target.'cfg(windows)'.dependencies]
+ssh2 = { version = "0.9", features = ["openssl-on-win32", "vendored-openssl"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
