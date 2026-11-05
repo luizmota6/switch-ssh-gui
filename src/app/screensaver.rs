@@ -1,8 +1,13 @@
-//! Protetor de tela estilo "chuva digital" (Matrix): colunas de caracteres verdes
-//! caindo sobre fundo preto. Liga após alguns minutos sem uso; qualquer tecla/mouse
-//! volta ao normal. Só esconde a tela: não bloqueia o cofre nem derruba a conexão.
+//! Protetor de tela: "Matrix" (chuva digital verde) ou "Pinguins" (pinguins que caem
+//! de guarda-chuva, andam e escalam a interface). Liga após alguns minutos sem uso;
+//! qualquer tecla/mouse volta ao normal. Não bloqueia o cofre nem derruba a conexão.
 
+mod penguins;
+
+pub use penguins::Stage;
+use crate::config::ScreensaverStyle;
 use eframe::egui::{self, pos2, vec2, Color32, FontId, Rect, Vec2};
+use penguins::Colony;
 use std::time::{Duration, Instant};
 
 /// Caracteres da chuva (as fontes embutidas não têm katakana).
@@ -65,14 +70,10 @@ struct Rain {
     glyphs: Vec<char>,
     drops: Vec<Drop>,
     rng: Rng,
-    started: Instant,
-    grace: Duration,
-    /// fecha no próximo frame (mantém a sobreposição neste para absorver o clique)
-    closing: bool,
 }
 
 impl Rain {
-    fn new(screen: Rect, col_w: f32, grace: Duration) -> Self {
+    fn new(screen: Rect, col_w: f32) -> Self {
         let mut rng = Rng::seeded();
         let cols = (screen.width() / col_w).ceil().max(1.0) as usize;
         let rows = (screen.height() / ROW_H).ceil().max(1.0) as usize;
@@ -86,9 +87,6 @@ impl Rain {
             glyphs,
             drops,
             rng,
-            started: Instant::now(),
-            grace,
-            closing: false,
         }
     }
 
@@ -164,50 +162,77 @@ impl Rain {
     }
 }
 
+enum Scene {
+    Matrix(Rain),
+    Penguins(Colony),
+}
+
+/// Protetor em exibição.
+struct Active {
+    scene: Scene,
+    screen: Rect,
+    started: Instant,
+    grace: Duration,
+    /// fecha no próximo frame (mantém a sobreposição neste para absorver o clique)
+    closing: bool,
+}
+
 pub struct Screensaver {
     last_activity: Instant,
-    rain: Option<Rain>,
-    /// `SWITCH_SSH_PROTETOR=1`: abre já com o protetor ativo (para testes/demonstração).
-    demo_pending: bool,
+    active: Option<Active>,
+    /// `SWITCH_SSH_PROTETOR=1` (ou `=pinguins`): abre já com o protetor ativo (testes/demonstração).
+    demo_pending: Option<ScreensaverStyle>,
 }
 
 impl Screensaver {
     pub fn new() -> Self {
+        let demo = std::env::var("SWITCH_SSH_PROTETOR").ok().and_then(|v| match v.as_str() {
+            "1" | "matrix" => Some(ScreensaverStyle::Matrix),
+            "pinguins" => Some(ScreensaverStyle::Pinguins),
+            _ => None,
+        });
         Self {
             last_activity: Instant::now(),
-            rain: None,
-            demo_pending: std::env::var_os("SWITCH_SSH_PROTETOR").is_some_and(|v| v == "1"),
+            active: None,
+            demo_pending: demo,
         }
     }
 
-    pub fn start_now(&mut self, ctx: &egui::Context) {
-        self.start(ctx, GRACE);
+    pub fn start_now(&mut self, ctx: &egui::Context, style: ScreensaverStyle) {
+        self.start(ctx, GRACE, style);
     }
 
-    fn start(&mut self, ctx: &egui::Context, grace: Duration) {
-        let col_w = ctx.fonts(|f| f.glyph_width(&FontId::monospace(FONT_SIZE), 'W')) + 4.0;
-        self.rain = Some(Rain::new(ctx.screen_rect(), col_w, grace));
+    fn start(&mut self, ctx: &egui::Context, grace: Duration, style: ScreensaverStyle) {
+        let screen = ctx.screen_rect();
+        let scene = match style {
+            ScreensaverStyle::Matrix => {
+                let col_w = ctx.fonts(|f| f.glyph_width(&FontId::monospace(FONT_SIZE), 'W')) + 4.0;
+                Scene::Matrix(Rain::new(screen, col_w))
+            }
+            ScreensaverStyle::Pinguins => Scene::Penguins(Colony::new(screen)),
+        };
+        self.active = Some(Active { scene, screen, started: Instant::now(), grace, closing: false });
     }
 
     /// Chamar no início de cada frame, antes dos widgets.
     /// `minutes` = 0 desliga. Devolve true se o protetor está cobrindo a tela.
-    pub fn update(&mut self, ctx: &egui::Context, minutes: u32) -> bool {
-        if self.demo_pending && ctx.screen_rect().width() > 100.0 {
-            self.demo_pending = false;
-            self.start(ctx, DEMO_GRACE);
+    pub fn update(&mut self, ctx: &egui::Context, minutes: u32, style: ScreensaverStyle) -> bool {
+        if let Some(demo) = self.demo_pending.filter(|_| ctx.screen_rect().width() > 100.0) {
+            self.demo_pending = None;
+            self.start(ctx, DEMO_GRACE, demo);
         }
         let active_input = ctx.input(|i| {
             !i.events.is_empty() || i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()
         });
 
-        if let Some(rain) = &mut self.rain {
-            if rain.closing {
-                self.rain = None;
+        if let Some(a) = &mut self.active {
+            if a.closing {
+                self.active = None;
                 self.last_activity = Instant::now();
                 return false;
             }
-            if active_input && rain.started.elapsed() > rain.grace {
-                rain.closing = true;
+            if active_input && a.started.elapsed() > a.grace {
+                a.closing = true;
                 // a tecla que acordou não vai para o terminal
                 ctx.input_mut(|i| i.events.clear());
             }
@@ -223,7 +248,7 @@ impl Screensaver {
         let limit = Duration::from_secs(minutes as u64 * 60);
         let idle = self.last_activity.elapsed();
         if idle >= limit {
-            self.start(ctx, GRACE);
+            self.start(ctx, GRACE, style);
             return true;
         }
         // acorda o app quando o tempo ocioso vencer
@@ -231,17 +256,24 @@ impl Screensaver {
         false
     }
 
-    /// Desenha a chuva por cima de tudo (chamar no fim do frame).
-    pub fn paint(&mut self, ctx: &egui::Context) {
+    /// Desenha o protetor por cima de tudo (chamar no fim do frame).
+    /// `stage` = bordas da interface onde os pinguins andam e escalam.
+    pub fn paint(&mut self, ctx: &egui::Context, stage: &Stage) {
         let screen = ctx.screen_rect();
-        // janela redimensionada: refaz a grade no novo tamanho
-        if self.rain.as_ref().is_some_and(|r| r.screen != screen && !r.closing) {
-            let grace = self.rain.as_ref().map_or(GRACE, |r| r.grace);
-            self.start(ctx, grace);
+        let Some(a) = &mut self.active else { return };
+        // janela redimensionada: a chuva refaz a grade no novo tamanho
+        if a.screen != screen && !a.closing {
+            if let Scene::Matrix(_) = a.scene {
+                let col_w = ctx.fonts(|f| f.glyph_width(&FontId::monospace(FONT_SIZE), 'W')) + 4.0;
+                a.scene = Scene::Matrix(Rain::new(screen, col_w));
+            }
+            a.screen = screen;
         }
-        let Some(rain) = &mut self.rain else { return };
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
-        rain.step(dt);
+        match &mut a.scene {
+            Scene::Matrix(r) => r.step(dt),
+            Scene::Penguins(c) => c.step(dt, screen, stage),
+        }
 
         egui::Area::new(egui::Id::new("screensaver"))
             .order(egui::Order::Foreground)
@@ -249,7 +281,22 @@ impl Screensaver {
             .show(ctx, |ui| {
                 // ocupa a tela toda e absorve cliques
                 ui.allocate_rect(screen, egui::Sense::click_and_drag());
-                rain.paint(ui.painter());
+                match &a.scene {
+                    Scene::Matrix(r) => r.paint(ui.painter()),
+                    Scene::Penguins(c) => {
+                        // o app continua visível por baixo, levemente escurecido
+                        let p = ui.painter();
+                        p.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 90));
+                        c.paint(p);
+                        p.text(
+                            pos2(screen.center().x, screen.top() + 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            "qualquer tecla ou mouse para voltar",
+                            FontId::proportional(12.0),
+                            Color32::from_gray(200),
+                        );
+                    }
+                }
             });
         ctx.request_repaint();
     }

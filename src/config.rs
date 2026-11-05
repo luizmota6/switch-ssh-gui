@@ -192,6 +192,8 @@ pub struct Config {
     pub log_sessions: bool,
     /// Protetor de tela (Matrix) após N minutos sem uso; 0 = desligado.
     pub screensaver_minutes: u32,
+    /// Estilo do protetor de tela.
+    pub screensaver_style: ScreensaverStyle,
 }
 
 impl Default for Config {
@@ -201,6 +203,7 @@ impl Default for Config {
             known_hosts: BTreeMap::new(),
             log_sessions: true,
             screensaver_minutes: 5,
+            screensaver_style: ScreensaverStyle::Matrix,
         }
     }
 }
@@ -323,5 +326,26 @@ mod login_tests {
             vec!["terminal length 0", "terminal width 0", "show clock", "show ip int brief"]
         );
         assert_eq!(skipped, vec!["reload"]);
+    }
+}
+
+/// Estilo do protetor de tela.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ScreensaverStyle {
+    /// Chuva digital verde.
+    #[default]
+    Matrix,
+    /// Pinguins que caem de guarda-chuva, andam e escalam a interface.
+    Pinguins,
+}
+
+impl ScreensaverStyle {
+    pub const ALL: [ScreensaverStyle; 2] = [ScreensaverStyle::Matrix, ScreensaverStyle::Pinguins];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScreensaverStyle::Matrix => "Matrix",
+            ScreensaverStyle::Pinguins => "Pinguins",
+        }
     }
 }
