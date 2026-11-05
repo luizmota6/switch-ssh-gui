@@ -3,6 +3,8 @@
 mod app;
 mod backup;
 mod config;
+mod monitor;
+mod scp;
 mod ssh;
 mod telnet;
 mod term;

@@ -22,6 +22,8 @@ hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
 qrcode = { version = "0.14", default-features = false }
+# Diálogos nativos de abrir/salvar arquivo (transferência SCP)
+rfd = "0.15"
 
 # Windows: OpenSSL estático em vez de WinCNG -> suporta curve25519, ed25519,
 # AES-GCM e chacha20 (exigidos por OpenSSH moderno). Compilar requer Perl
