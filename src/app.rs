@@ -5,7 +5,7 @@ mod transfer;
 
 use crate::backup::{self, Backup};
 use security::{LockScreen, SecurityDialog, VaultSession};
-use screensaver::Screensaver;
+use screensaver::{Screensaver, Stage};
 use session::{ConnState, MonitorState, Session, SessionEvent};
 use transfer::TransferDialog;
 use crate::config::{backups_dir, logs_dir, AuthKind, Config, Profile, Protocol};
@@ -1680,15 +1680,16 @@ fn open_in_file_manager(dir: &std::path::Path) {
 impl eframe::App for SwitchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
-        self.screensaver.update(ctx, self.cfg.screensaver_minutes);
+        self.screensaver
+            .update(ctx, self.cfg.screensaver_minutes, self.cfg.screensaver_style);
         if self.locked.is_some() {
             self.ui_lock_screen(ctx);
-            self.screensaver.paint(ctx);
+            self.screensaver.paint(ctx, &Stage::window(ctx.screen_rect()));
             return;
         }
         self.check_backups(ctx);
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let status_rect = egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let color = self.active_session().map_or(Color32::GRAY, Session::state_color);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
@@ -1700,8 +1701,26 @@ impl eframe::App for SwitchApp {
                 }
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button(RichText::new("Matrix").monospace().color(Color32::from_rgb(90, 220, 110))).on_hover_text("Iniciar o protetor de tela agora").clicked() {
-                        self.screensaver.start_now(ctx);
+                    if ui
+                        .small_button(RichText::new("▶").color(Color32::from_rgb(90, 220, 110)))
+                        .on_hover_text("Iniciar o protetor de tela agora")
+                        .clicked()
+                    {
+                        self.screensaver.start_now(ctx, self.cfg.screensaver_style);
+                    }
+                    let before = self.cfg.screensaver_style;
+                    egui::ComboBox::from_id_salt("ss_style")
+                        .selected_text(self.cfg.screensaver_style.label())
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for s in crate::config::ScreensaverStyle::ALL {
+                                ui.selectable_value(&mut self.cfg.screensaver_style, s, s.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("Estilo do protetor de tela");
+                    if self.cfg.screensaver_style != before {
+                        self.save_cfg();
                     }
                     let r = ui
                         .add(
@@ -1720,25 +1739,33 @@ impl eframe::App for SwitchApp {
                     }
                 });
             });
-        });
+        })
+        .response
+        .rect;
 
-        egui::SidePanel::left("profiles")
+        let left_rect = egui::SidePanel::left("profiles")
             .resizable(true)
             .default_width(330.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().id_salt("left").show(ui, |ui| {
                     self.ui_profiles(ui);
                 });
-            });
+            })
+            .response
+            .rect;
 
-        egui::SidePanel::right("quick")
+        let right_rect = egui::SidePanel::right("quick")
             .resizable(true)
             .default_width(190.0)
-            .show(ctx, |ui| self.ui_quick(ui));
+            .show(ctx, |ui| self.ui_quick(ui))
+            .response
+            .rect;
 
-        egui::TopBottomPanel::bottom("input")
+        let input_rect = egui::TopBottomPanel::bottom("input")
             .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(8.0))
-            .show(ctx, |ui| self.ui_input(ui));
+            .show(ctx, |ui| self.ui_input(ui))
+            .response
+            .rect;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(e) = self.error.clone() {
@@ -1757,7 +1784,23 @@ impl eframe::App for SwitchApp {
         self.ui_modals(ctx);
         self.ui_transfer(ctx);
         self.ui_security(ctx);
-        self.screensaver.paint(ctx);
+
+        // cenário dos pinguins: andam no topo da barra de comando e do rodapé,
+        // e escalam as bordas dos painéis laterais e da janela
+        let screen = ctx.screen_rect();
+        let stage = Stage {
+            floors: vec![
+                (status_rect.top(), screen.left(), screen.right()),
+                (input_rect.top(), input_rect.left(), input_rect.right()),
+            ],
+            walls: vec![
+                (screen.left(), screen.top(), status_rect.top()),
+                (screen.right(), screen.top(), status_rect.top()),
+                (left_rect.right(), left_rect.top(), left_rect.bottom()),
+                (right_rect.left(), right_rect.top(), right_rect.bottom()),
+            ],
+        };
+        self.screensaver.paint(ctx, &stage);
     }
 }
 
