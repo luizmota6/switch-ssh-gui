@@ -2,21 +2,22 @@ use serde::{Deserialize, Serialize};
 
 /// Perfis de fabricante: comandos de inicialização (desligar paginação)
 /// e atalhos de comandos somente-leitura.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Sem padrão: o fabricante precisa ser escolhido explicitamente em cada perfil.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Vendor {
     ArubaCx,
-    #[default]
     ArubaAosS,
     CiscoIos,
     HpeComware,
     Dell,
     Mikrotik,
     PaloAlto,
+    Fortigate,
     Generico,
 }
 
 impl Vendor {
-    pub const ALL: [Vendor; 8] = [
+    pub const ALL: [Vendor; 9] = [
         Vendor::ArubaCx,
         Vendor::ArubaAosS,
         Vendor::CiscoIos,
@@ -24,6 +25,7 @@ impl Vendor {
         Vendor::Dell,
         Vendor::Mikrotik,
         Vendor::PaloAlto,
+        Vendor::Fortigate,
         Vendor::Generico,
     ];
 
@@ -36,6 +38,7 @@ impl Vendor {
             Vendor::Dell => "Dell (N-Series OS6 / OS9 / OS10)",
             Vendor::Mikrotik => "MikroTik RouterOS",
             Vendor::PaloAlto => "Palo Alto PAN-OS",
+            Vendor::Fortigate => "Fortinet FortiGate (FortiOS)",
             Vendor::Generico => "Genérico",
         }
     }
@@ -51,6 +54,9 @@ impl Vendor {
             // RouterOS não tem comando global para desligar o pager; o auto --More-- cuida disso
             Vendor::Mikrotik => &[],
             Vendor::PaloAlto => &["set cli pager off"],
+            // FortiOS só desliga o pager alterando a config (config system console);
+            // o auto --More-- cuida disso sem mexer no equipamento
+            Vendor::Fortigate => &[],
             Vendor::Generico => &[],
         }
     }
@@ -61,6 +67,8 @@ impl Vendor {
             Vendor::HpeComware => "display current-configuration",
             Vendor::Mikrotik => "/export",
             Vendor::PaloAlto => "show config running",
+            // só o que difere do padrão: mesmo formato do backup .conf do FortiOS
+            Vendor::Fortigate => "show",
             _ => "show running-config",
         }
     }
@@ -70,6 +78,7 @@ impl Vendor {
         match self {
             Vendor::Mikrotik => "rsc",
             Vendor::PaloAlto => "xml",
+            Vendor::Fortigate => "conf",
             _ => "cfg",
         }
     }
@@ -151,6 +160,17 @@ impl Vendor {
                 ("Jobs", "show jobs all"),
                 ("Configuração", "show config running"),
             ],
+            Vendor::Fortigate => &[
+                ("Status", "get system status"),
+                ("Desempenho", "get system performance status"),
+                ("Interfaces", "get system interface physical"),
+                ("Rotas", "get router info routing-table all"),
+                ("Tabela ARP", "get system arp"),
+                ("Sessões", "diagnose sys session stat"),
+                ("HA", "get system ha status"),
+                ("VPN IPsec", "get vpn ipsec tunnel summary"),
+                ("Configuração", "show"),
+            ],
             Vendor::Generico => &[],
         }
     }
@@ -175,6 +195,14 @@ pub fn is_dangerous(cmd: &str) -> bool {
         || c.starts_with("request restart")
         || c.starts_with("request shutdown")
         || c.contains("private-data-reset")
+        // FortiGate (reboot/shutdown/factoryreset já cobertos acima via "contains")
+        || c.starts_with("execute reboot")
+        || c.starts_with("execute shutdown")
+        || c.starts_with("execute restore")
+        || c.starts_with("execute formatlogdisk")
+        || c.starts_with("execute erase-disk")
+        // `purge` apaga TODAS as entradas da tabela em edição
+        || c.starts_with("purge")
 }
 
 #[cfg(test)]
@@ -189,5 +217,20 @@ mod tests {
         assert!(is_dangerous("request system private-data-reset"));
         assert!(!is_dangerous("/system resource print"));
         assert!(!is_dangerous("show config running"));
+    }
+
+    #[test]
+    fn fortigate() {
+        assert!(is_dangerous("execute reboot"));
+        assert!(is_dangerous("execute shutdown"));
+        assert!(is_dangerous("execute factoryreset"));
+        assert!(is_dangerous("execute restore config tftp backup.conf 10.0.0.5"));
+        assert!(is_dangerous("purge"));
+        assert!(!is_dangerous("get system status"));
+        assert!(!is_dangerous("show"));
+        assert_eq!(Vendor::Fortigate.backup_command(), "show");
+        assert_eq!(Vendor::Fortigate.backup_extension(), "conf");
+        assert!(Vendor::Fortigate.init_commands().is_empty());
+        assert!(Vendor::ALL.contains(&Vendor::Fortigate));
     }
 }

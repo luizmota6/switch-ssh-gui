@@ -22,13 +22,23 @@ pub struct TermOutput {
     pub input: Vec<u8>,
     /// Novo tamanho (cols, rows) se a área mudou.
     pub resized: Option<(u16, u16)>,
+    /// O painel foi clicado neste frame.
+    pub clicked: bool,
+    /// O terminal está com o foco do teclado.
+    pub focused: bool,
 }
 
 impl VTerm {
+    #[cfg(test)]
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_id(cols, rows, egui::Id::new("vterm"))
+    }
+
+    /// `id` precisa ser único por sessão (foco do teclado é por widget).
+    pub fn with_id(cols: u16, rows: u16, id: egui::Id) -> Self {
         Self {
             parser: vt100::Parser::new(nz(rows), nz(cols), 5000),
-            id: egui::Id::new("vterm"),
+            id,
         }
     }
 
@@ -57,7 +67,7 @@ impl VTerm {
     /// Desenha o terminal ocupando todo o espaço disponível e captura o teclado
     /// quando focado. `enabled` = sessão conectada.
     pub fn show(&mut self, ui: &mut egui::Ui, enabled: bool) -> TermOutput {
-        let mut out = TermOutput { input: Vec::new(), resized: None };
+        let mut out = TermOutput { input: Vec::new(), resized: None, clicked: false, focused: false };
         let font = FontId::monospace(13.5);
         let (cw, rh) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
 
@@ -68,6 +78,8 @@ impl VTerm {
             resp.request_focus();
         }
         let focused = resp.has_focus();
+        out.clicked = resp.clicked();
+        out.focused = focused;
 
         // ---- tamanho ----
         let cols = (((rect.width() - 2.0 * PAD) / cw).floor() as u16).clamp(20, 500);

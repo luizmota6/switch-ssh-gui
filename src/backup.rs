@@ -86,6 +86,10 @@ pub fn extract_config(lines: &[String], cmd: &str) -> Result<String, String> {
             // Palo Alto
             "invalid syntax",
             "server error",
+            // FortiGate
+            "command parse error",
+            "unknown action",
+            "command fail",
         ]
         .iter()
         .any(|e| first.contains(e));

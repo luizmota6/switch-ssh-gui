@@ -1,7 +1,7 @@
 //! Telas de segurança: desbloqueio (senha mestra + 2FA), ativação, troca de senha,
 //! códigos de recuperação e desativação do cofre.
 
-use super::{ConnState, SwitchApp};
+use super::SwitchApp;
 use crate::config::{config_path, vault_path, Config, Profile};
 use crate::totp;
 use crate::vault::{Vault, VaultData, MIN_PASSWORD};
@@ -329,21 +329,17 @@ impl SwitchApp {
         false
     }
 
-    /// Fecha o cofre: derruba a sessão e apaga da memória perfis, senhas e a saída do terminal.
+    /// Fecha o cofre: derruba todas as sessões e apaga da memória perfis, senhas e a saída dos terminais.
     pub(super) fn lock(&mut self) {
-        if let Some(c) = self.conn.take() {
-            c.send(crate::ssh::ToWorker::Disconnect);
+        for mut s in self.sessions.drain(..) {
+            s.disconnect();
+            s.close_log();
         }
-        self.close_log();
-        self.state = ConnState::Disconnected;
-        self.session_profile = None;
-        self.backup = None;
+        self.active = 0;
         self.vault = None;
         self.cfg = Config::default();
         self.selected = None;
         self.select_form(Profile::default());
-        self.term.clear();
-        self.vterm.clear();
         self.input.clear();
         self.history.clear();
         self.confirm = None;

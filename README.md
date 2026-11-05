@@ -24,8 +24,9 @@ Interface desktop para acesso SSH/CLI a switches gerenciáveis. Binário único,
 | Dell (N-Series OS6 / OS9 / OS10) | `terminal length 0` | version, ip int brief, int status, vlan, mac, LLDP, running-config, logging |
 | MikroTik RouterOS | — (o pager `[Q quit\|D dump\|down]` é respondido com D) | resource, routerboard, interfaces, IP, rotas, bridge host, neighbors, `/export`, log |
 | Palo Alto PAN-OS | `set cli pager off` | system info/resources, interfaces, rotas, ARP, sessões, HA, jobs, `show config running` |
+| Fortinet FortiGate (FortiOS) | — (desligar o pager exige alterar a config; o auto `--More--` responde) | system status/performance, interfaces, rotas, ARP, sessões, HA, VPN IPsec, `show` |
 
-Backup da configuração por fabricante: `show running-config` (`.cfg`) na maioria; Comware `display current-configuration` (`.cfg`); MikroTik `/export` (`.rsc`, reimporta com `/import`); Palo Alto `show config running` (`.xml`, formato que o PAN-OS importa).
+Backup da configuração por fabricante: `show running-config` (`.cfg`) na maioria; Comware `display current-configuration` (`.cfg`); MikroTik `/export` (`.rsc`, reimporta com `/import`); Palo Alto `show config running` (`.xml`, formato que o PAN-OS importa); FortiGate `show` (`.conf`, mesmo formato do backup do FortiOS).
 | Genérico | — | só os personalizados |
 
 - **Backup da configuração** (SSH ou Telnet): botão no painel direito executa `show running-config` (Comware: `display current-configuration`), pagina sozinho, espera o prompt voltar e grava só a configuração (sem eco nem prompt) em `backups\<perfil>_<data>.cfg`. Respostas de erro da CLI (ex.: falta de `enable` no Cisco) não viram arquivo.

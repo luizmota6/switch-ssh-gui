@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 pub enum Auth {
     Password(String),
     Key {
@@ -142,11 +143,13 @@ pub(crate) fn connect_tcp(host: &str, port: u16, emit: &dyn Fn(FromWorker)) -> R
     Err(format!("Falha TCP ({last_err})"))
 }
 
-fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> Result<(), String> {
-    // 1. TCP
-    let tcp = connect_tcp(&p.host, p.port, emit)?;
-
-    // 2. Handshake SSH
+/// Handshake SSH; devolve a sessão, o fingerprint SHA256 e o tipo da chave do host.
+pub(crate) fn handshake(
+    tcp: TcpStream,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<(Session, String, String), String> {
     let mut sess = Session::new().map_err(|e| e.to_string())?;
     sess.set_tcp_stream(tcp);
     sess.set_timeout(15_000);
@@ -154,12 +157,9 @@ fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> 
         format!(
             "Handshake SSH falhou: {e}\n\
              Sem algoritmo de criptografia em comum com o servidor. Diagnóstico:\n  \
-             ssh -vv -p {} {}@{}  (veja as linhas 'kex' e 'host key')",
-            p.port, p.user, p.host
+             ssh -vv -p {port} {user}@{host}  (veja as linhas 'kex' e 'host key')"
         )
     })?;
-
-    // 3. Verificação da chave do host (TOFU)
     let fp_raw = sess
         .host_key_hash(HashType::Sha256)
         .ok_or("Servidor não apresentou chave de host")?;
@@ -171,16 +171,60 @@ fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> 
         .host_key()
         .map(|(_, t)| format!("{t:?}"))
         .unwrap_or_else(|| "desconhecido".into());
+    Ok((sess, fingerprint, key_type))
+}
 
-    match &p.known_fingerprint {
-        Some(known) if *known == fingerprint => {}
-        Some(known) => {
-            return Err(format!(
-                "ALERTA DE SEGURANÇA: a chave do host mudou!\n  salva:    {known}\n  recebida: {fingerprint}\n\
-                 Pode ser troca de firmware/hardware — ou um ataque man-in-the-middle.\n\
-                 Se a mudança for legítima, remova a chave salva no perfil e conecte de novo."
-            ));
+/// Compara o fingerprint recebido com o salvo (diferença = troca de chave ou MITM).
+pub(crate) fn verify_known(known: &str, fingerprint: &str) -> Result<(), String> {
+    if known == fingerprint {
+        return Ok(());
+    }
+    Err(format!(
+        "ALERTA DE SEGURANÇA: a chave do host mudou!\n  salva:    {known}\n  recebida: {fingerprint}\n\
+         Pode ser troca de firmware/hardware — ou um ataque man-in-the-middle.\n\
+         Se a mudança for legítima, remova a chave salva no perfil e conecte de novo."
+    ))
+}
+
+/// Autentica por senha (password / keyboard-interactive) ou chave privada.
+pub(crate) fn authenticate(sess: &Session, user: &str, auth: &Auth) -> Result<(), String> {
+    let methods = sess.auth_methods(user).unwrap_or("").to_string();
+    if !sess.authenticated() {
+        match auth {
+            Auth::Password(pw) => {
+                if methods.is_empty() || methods.contains("password") {
+                    let _ = sess.userauth_password(user, pw);
+                }
+                if !sess.authenticated() && methods.contains("keyboard-interactive") {
+                    let mut pr = PasswordPrompter(pw.clone());
+                    let _ = sess.userauth_keyboard_interactive(user, &mut pr);
+                }
+            }
+            Auth::Key { path, passphrase } => {
+                sess.userauth_pubkey_file(user, None, path, passphrase.as_deref())
+                    .map_err(|e| format!("Falha na autenticação por chave: {e}"))?;
+            }
         }
+    }
+    if !sess.authenticated() {
+        return Err(format!(
+            "Falha de autenticação (métodos aceitos pelo servidor: {})",
+            if methods.is_empty() { "?" } else { &methods }
+        ));
+    }
+    Ok(())
+}
+
+fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> Result<(), String> {
+    // 1. TCP
+    let tcp = connect_tcp(&p.host, p.port, emit)?;
+
+    // 2. Handshake SSH
+    let (sess, fingerprint, key_type) = handshake(tcp, &p.host, p.port, &p.user)?;
+
+    // 3. Verificação da chave do host (TOFU)
+    match &p.known_fingerprint {
+        Some(known) => verify_known(known, &fingerprint)?,
         None => {
             emit(FromWorker::HostKeyPrompt {
                 fingerprint: fingerprint.clone(),
@@ -212,30 +256,7 @@ fn run(p: ConnectParams, rx: &Receiver<ToWorker>, emit: &dyn Fn(FromWorker)) -> 
     } else {
         format!("Autenticando como {}…", p.user)
     }));
-    let methods = sess.auth_methods(&p.user).unwrap_or("").to_string();
-    if !sess.authenticated() {
-        match &p.auth {
-            Auth::Password(pw) => {
-                if methods.is_empty() || methods.contains("password") {
-                    let _ = sess.userauth_password(&p.user, pw);
-                }
-                if !sess.authenticated() && methods.contains("keyboard-interactive") {
-                    let mut pr = PasswordPrompter(pw.clone());
-                    let _ = sess.userauth_keyboard_interactive(&p.user, &mut pr);
-                }
-            }
-            Auth::Key { path, passphrase } => {
-                sess.userauth_pubkey_file(&p.user, None, path, passphrase.as_deref())
-                    .map_err(|e| format!("Falha na autenticação por chave: {e}"))?;
-            }
-        }
-    }
-    if !sess.authenticated() {
-        return Err(format!(
-            "Falha de autenticação (métodos aceitos pelo servidor: {})",
-            if methods.is_empty() { "?" } else { &methods }
-        ));
-    }
+    authenticate(&sess, &p.user, &p.auth)?;
 
     // 5. Shell interativo com PTY
     let mut ch = sess
