@@ -1,6 +1,6 @@
 [package]
 name = "switch-ssh-gui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Interface desktop (egui) para acesso SSH/CLI a switches gerenciáveis"
 license = "MIT"
